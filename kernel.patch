@@ -1,0 +1,243 @@
+diff --git a/arch/arm64/boot/dts/rockchip/tspi-rk3566-user-v10-linux.dts b/arch/arm64/boot/dts/rockchip/tspi-rk3566-user-v10-linux.dts
+index 97da688286b2..a84427288cac 100755
+--- a/arch/arm64/boot/dts/rockchip/tspi-rk3566-user-v10-linux.dts
++++ b/arch/arm64/boot/dts/rockchip/tspi-rk3566-user-v10-linux.dts
+@@ -42,7 +42,7 @@
+ #include "tspi-rk3566-csi-v10.dtsi"
+ 
+ //【开/关】网口 扩展板上使用的是千兆网，不接扩展板情况下可以关闭
+-// #include "tspi-rk3566-gmac1-v10.dtsi"
++#include "tspi-rk3566-gmac1-v10.dtsi"
+ 
+ //【开/关】下方是用户定义层，所有用户修改理论上在此下方修改就好了
+ / {
+@@ -80,13 +80,48 @@
+ 			linux,blink-delay-off = <1500>;
+ 		};
+ 	};
++	
++	vcc5v0_ex39_host: vcc5v0-ex39-host-regulator {
++		compatible = "regulator-fixed";
++		regulator-name = "vcc5v0_ex39_host";
++		regulator-boot-on;
++		regulator-always-on;
++		regulator-min-microvolt = <5000000>;
++		regulator-max-microvolt = <5000000>;
++		enable-active-high;
++		gpio = <&gpio0 RK_PA5 GPIO_ACTIVE_HIGH>;
++		vin-supply = <&vcc5v0_usb>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&ex39_usb_vcc5v0_host_en>;
++	};	
++
++};
++
++&usbhost_dwc3 {
++	phys = <&u2phy0_host>; 
++	phy-names = "usb2-phy";
++	maximum-speed = "high-speed"; 
++	status = "okay";
++};
++&combphy1_usq {
++	rockchip,dis-u3otg1-port; 
++	status = "okay";
++};
+ 
++&sata1 {
++	rockchip,enable-ssc;
++	status = "okay";
+ };
+ 
+ &pinctrl {
+ 	headphone {
+ 		hp_det: hp-det {
+-			rockchip,pins = <0 RK_PC5 RK_FUNC_GPIO &pcfg_pull_none>;
++			rockchip,pins = <0 RK_PC5 RK_FUNC_GPIO &pcfg_pull_down>;
++		};
++	};
++	ex39_usb {
++		ex39_usb_vcc5v0_host_en: ex39-usb-vcc5v0-host-en {
++			rockchip,pins = <0 RK_PA5 RK_FUNC_GPIO &pcfg_pull_up>;
+ 		};
+ 	};
+ };
+@@ -98,7 +133,7 @@
+ 
+ //耳机插入检测，不使用扩展板情况需关闭，否则默认会检测到耳机插入
+ &rk_headset {
+-	status = "disabled";
++	status = "okay";
+ };
+ 
+ //用户串口3
+diff --git a/drivers/net/ethernet/stmicro/stmmac/Kconfig b/drivers/net/ethernet/stmicro/stmmac/Kconfig
+index 21f40747f28b..b6debe20f1d9 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/Kconfig
++++ b/drivers/net/ethernet/stmicro/stmmac/Kconfig
+@@ -137,6 +137,29 @@ config DWMAC_ROCKCHIP_TOOL
+ 	  This selects the features for Rockchip's Ethernet, include PHY loopback,
+ 	  MAC loopback, and delayline scanning of RGMII mode.
+ 
++config DWMAC_RK_AUTO_DELAYLINE
++	bool "Auto search rgmii delayline"
++	default DWMAC_ROCKCHIP
++	depends on DWMAC_ROCKCHIP
++	help
++	  Auto search suitable rgmii delayline at first boot, and save it
++	  at vendor storage if success.
++
++config DWMAC_RK_AUTO_DELAYLINE_RAPID_SEARCH
++	bool "Rapid search"
++	default DWMAC_RK_AUTO_DELAYLINE
++	depends on DWMAC_RK_AUTO_DELAYLINE
++	help
++	  The delaylines are halted as soon as they become available, rather
++	  than choosing the median value after all scans.
++
++config DWMAC_RK_DELAYLINE_SCAN_STEP
++	hex "Auto search rgmii delayline step"
++	default 0x1
++	depends on DWMAC_ROCKCHIP
++	help
++	  The step of the auto search.
++
+ config DWMAC_SOCFPGA
+ 	tristate "SOCFPGA dwmac support"
+ 	default (ARCH_SOCFPGA || ARCH_STRATIX10)
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-rk-tool.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-rk-tool.c
+index 46633a665f7e..51680ed94e43 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-rk-tool.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-rk-tool.c
+@@ -99,7 +99,7 @@ struct dwmac_rk_lb_priv {
+ 
+ #define	STMMAC_ALIGN(x) __ALIGN_KERNEL(x, SMP_CACHE_BYTES)
+ #define MAX_DELAYLINE 0x7f
+-#define SCAN_STEP 0x5
++#define SCAN_STEP CONFIG_DWMAC_RK_DELAYLINE_SCAN_STEP
+ #define SCAN_VALID_RANGE 0xA
+ 
+ #define DWMAC_RK_TEST_PKT_SIZE (sizeof(struct ethhdr) + sizeof(struct iphdr) + \
+@@ -1452,3 +1452,54 @@ int dwmac_rk_remove_loopback_sysfs(struct device *device)
+ 
+ 	return 0;
+ }
++
++#ifdef CONFIG_DWMAC_RK_AUTO_DELAYLINE
++int dwmac_rk_search_rgmii_delayline(struct stmmac_priv *priv)
++{
++	struct dwmac_rk_lb_priv *lb_priv;
++	int phy_iface = dwmac_rk_get_phy_interface(priv);
++	unsigned char delayline[2];
++	int ret;
++
++	if (phy_iface != PHY_INTERFACE_MODE_RGMII &&
++	    phy_iface != PHY_INTERFACE_MODE_RGMII_ID)
++		return 0;
++
++	memset(delayline, 0x0, sizeof(delayline));
++	ret = rk_vendor_read(LAN_RGMII_DL_ID, delayline, 2);
++	if (ret == 2 &&
++	    dwmac_rk_delayline_is_valid(delayline[0], delayline[1])) {
++		pr_info("Read rgmii delayline from vendor: tx = 0x%02x, rx = 0x%02x\n",
++			delayline[0], delayline[1]);
++		dwmac_rk_set_rgmii_delayline(priv, delayline[0], delayline[1]);
++
++		return 0;
++	}
++
++	lb_priv = kzalloc(sizeof(*lb_priv), GFP_KERNEL);
++	if (!lb_priv)
++		return -ENOMEM;
++
++#ifdef CONFIG_DWMAC_RK_AUTO_DELAYLINE_RAPID_SEARCH
++	lb_priv->sysfs = 0;
++#else
++	lb_priv->sysfs = 1;
++#endif
++	lb_priv->type = LOOPBACK_TYPE_PHY;
++	lb_priv->speed = LOOPBACK_SPEED1000;
++	lb_priv->scan = 1;
++
++	ret = dwmac_rk_loopback_run(priv, lb_priv);
++	if (!ret) {
++		delayline[0] = lb_priv->final_tx;
++		delayline[1] = lb_priv->final_rx;
++		if (!rk_vendor_write(LAN_RGMII_DL_ID, delayline, 2))
++		/* write tx/rx delayline back if loopback okay */
++		dwmac_rk_set_rgmii_delayline(priv, lb_priv->final_tx,
++					     lb_priv->final_rx);
++	}
++
++	kfree(lb_priv);
++	return ret;
++}
++#endif
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac.h b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+index 1eaa1f8bdbe2..246d6e9bd873 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac.h
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+@@ -188,6 +188,11 @@ struct stmmac_priv {
+ 	void __iomem *mmcaddr;
+ 	void __iomem *ptpaddr;
+ 
++#ifdef CONFIG_DWMAC_RK_AUTO_DELAYLINE
++	bool delayline_scanned;
++	struct delayed_work scan_dwork;
++#endif
++
+ #ifdef CONFIG_DEBUG_FS
+ 	struct dentry *dbgfs_dir;
+ 	struct dentry *dbgfs_rings_status;
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 7ff658739cf3..e86886919ebc 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -54,6 +54,7 @@
+ #include "dwmac1000.h"
+ #include "dwxgmac2.h"
+ #include "hwif.h"
++#include "dwmac-rk-tool.h"
+ 
+ #define	STMMAC_ALIGN(x)		ALIGN(ALIGN(x, SMP_CACHE_BYTES), 16)
+ #define	TSO_MAX_BUFF_SIZE	(SZ_16K - 1)
+@@ -2691,6 +2692,13 @@ static int stmmac_open(struct net_device *dev)
+ 	stmmac_enable_all_queues(priv);
+ 	netif_tx_start_all_queues(priv->dev);
+ 
++#ifdef CONFIG_DWMAC_RK_AUTO_DELAYLINE
++	if (!priv->delayline_scanned) {
++		priv->delayline_scanned = true;
++		schedule_delayed_work(&priv->scan_dwork, msecs_to_jiffies(6000));
++	}
++#endif
++
+ 	return 0;
+ 
+ lpiirq_error:
+@@ -4266,6 +4274,15 @@ static int stmmac_hw_init(struct stmmac_priv *priv)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_DWMAC_RK_AUTO_DELAYLINE
++static void stmmac_scan_delayline_dwork(struct work_struct *work)
++{
++	struct stmmac_priv *priv = container_of(work, struct stmmac_priv,
++						scan_dwork.work);
++	dwmac_rk_search_rgmii_delayline(priv);
++};
++#endif
++
+ /**
+  * stmmac_dvr_probe
+  * @device: device pointer
+@@ -4459,6 +4476,10 @@ int stmmac_dvr_probe(struct device *device,
+ 			    __func__);
+ #endif
+ 
++#ifdef CONFIG_DWMAC_RK_AUTO_DELAYLINE
++	INIT_DELAYED_WORK(&priv->scan_dwork, stmmac_scan_delayline_dwork);
++#endif
++
+ 	return ret;
+ 
+ error_netdev_register:
